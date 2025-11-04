@@ -1,0 +1,208 @@
+######## Dynamic Greenspace
+library(readr)
+library(dplyr)
+library(sf)
+library(data.table)
+library(lubridate)
+library(ggplot2)
+##冲绳那霸市建成区内动态暴露
+test_data <- read_csv("/Users/liaojiajia/博士研究/冲绳/原数据/PDP_0001_20230801.csv", show_col_types = FALSE)
+filtered_data <- test_data %>% 
+  filter(citycode == 47201)
+print(filtered_data)
+# 随机选择10个独特的 dailyid
+selected_dailyids <- test_data %>% 
+  distinct(dailyid) %>% 
+  sample_n(30) 
+# 根据选定的 dailyid 筛选数据
+filtered_data <- test_data %>% 
+  filter(dailyid %in% selected_dailyids$dailyid)
+# 查看筛选后的数据
+print(filtered_data)
+write_csv(filtered_data, "/Users/liaojiajia/博士研究/冲绳/filtered_data.csv")
+
+#######################
+filtered_data <- fread("/Users/liaojiajia/博士研究/冲绳/filtered_data.csv")
+filtered_data <- as.data.table(filtered_data)
+filtered_data[, timestamp := ISOdatetime(year, month, day, hour, minute, sec=0)]
+print(head(filtered_data))
+# 检查独特的 dailyid 数量
+unique_user_count <- uniqueN(filtered_data$dailyid)
+# 输出独特用户数量
+print(paste("Number of unique users (tourists):", unique_user_count))
+
+# 将移动数据转换为sf对象
+filtered_data_sf <- st_as_sf(filtered_data, coords = c("longitude", "latitude"), crs = 4326)
+# 加载城市边界线数据
+city_boundary <- st_read("/Users/liaojiajia/博士研究/冲绳/地图/那霸市/N03-20240101_47.shp")
+city_boundary <- st_transform(city_boundary, 4326)  # 确保与移动数据相同的 CRS
+# 确保 city_boundary 与 filtered_data_sf 使用相同的 CRS
+city_boundary <- st_transform(city_boundary, st_crs(filtered_data_sf))
+# 过滤掉城市边界外的移动数据点
+filtered_data_sf <- st_intersection(filtered_data_sf, city_boundary)
+
+# 加载NDVI网格数据
+ndvi_grids <- st_read("/Users/liaojiajia/博士研究/冲绳/test/grip.shp")
+ndvi_grids <- st_set_crs(ndvi_grids, 2443)  # 设置为日本平面直角坐标系
+ndvi_grids_wgs84 <- st_transform(ndvi_grids, 4326)  # 转换为WGS84进行通用可视化
+# 将 NDVI 中小于 0 的 X_mean 值设置为 0
+ndvi_grids_wgs84 <- ndvi_grids_wgs84 %>%
+  mutate(X_mean = ifelse(X_mean < 0, 0, X_mean))
+print(head(ndvi_grids_wgs84))
+
+
+# 使用ggplot2可视化NDVI网格数据
+ggplot(data = ndvi_grids_wgs84) +
+  geom_sf(aes(fill = X_mean), color = NA) +  # 使用X_mean字段来填充颜色
+  scale_fill_viridis_c(option = "C", direction = 1, begin = 0, end = 1, name = "NDVI") +  # 设置颜色渐变
+  labs(title = "NDVI Grid Visualization", subtitle = "Spatial distribution of NDVI values") +  # 添加标题和副标题
+  theme_minimal()  # 使用简洁主题
+
+
+# 打印两个数据集的CRS
+print(st_crs(filtered_data_sf))
+print(st_crs(ndvi_grids_wgs84))
+print(st_bbox(ndvi_grids_wgs84))
+print(st_bbox(filtered_data_sf))
+# 空间关联，匹配每个移动点到最近的NDVI网格
+mobile_ndvi <- st_join(filtered_data_sf, ndvi_grids_wgs84, join = st_nearest_feature)
+print(head(mobile_ndvi))
+# 使用 ggplot2 进行可视化
+ggplot() +
+  geom_sf(data = ndvi_grids_wgs84, fill = "grey80", color = "white") +
+  geom_sf(data = mobile_ndvi, aes(color = X_mean), size = 2) +
+  scale_color_viridis_c(name = "NDVI Value") +
+  labs(title = "Mobile Data and NDVI Grid Visualization", subtitle = "Spatial distribution of NDVI values in Naha, Okinawa") +
+  theme_minimal()
+
+
+
+#########
+############# 设置滞留事件
+# 确保 mobile_ndvi 是一个 data.table
+mobile_ndvi <- as.data.table(mobile_ndvi)
+unique_user_count <- uniqueN(mobile_ndvi$dailyid)
+print(paste("Number of unique users (tourists):", unique_user_count))
+# 确保 timestamp 列是正确的时间格式
+mobile_ndvi[, timestamp := as.POSIXct(timestamp, format = "%Y-%m-%d %H:%M:%S")]
+
+ # 定义滞留事件识别函数
+identify_stay_events <- function(data) {
+  data <- data[order(dailyid, timestamp)]  # 按用户和时间排序
+  stay_events <- list()
+  # 检查 dailyid 和 id 列是否存在于 data 中
+  if (!"dailyid" %in% names(data) || !"id" %in% names(data)) {
+    stop("Error: 'dailyid' or 'id' column not found in the data.")
+  }
+  
+  for (user in unique(data$dailyid)) {
+    user_data <- data[dailyid == user]  # 根据 dailyid 分组数据
+    
+    # 检查每个用户的数据
+    print(paste("Processing user:", user))
+    print(head(user_data))
+    
+    current_grid <- NULL
+    entry_time <- NULL
+    
+    for (i in 1:(nrow(user_data) - 1)) {
+      row <- user_data[i, ]
+      next_row <- user_data[i + 1, ]
+      grid_id <- row$id  # 使用 id 列来获取网格ID
+      next_grid_id <- next_row$id  # 下一行的网格ID
+      
+      if (is.null(grid_id) || length(grid_id) == 0) {
+        print("Warning: grid_id is NULL or empty.")
+        next
+      }
+      
+      # 打印当前 grid_id 和 current_grid 值
+      print(paste("Current grid_id:", grid_id, "Current grid:", current_grid))
+      
+      # 判断 current_grid 是否为空，如果为空，直接赋值
+      if (is.null(current_grid)) {
+        current_grid <- grid_id
+        entry_time <- row$timestamp
+        next
+      }
+      
+      # 正常比较 current_grid 和 grid_id
+      if (grid_id != current_grid) {
+        # 如果进入新网格，记录开始时间
+        if (!is.null(entry_time)) {
+          exit_time <- row$timestamp
+          stay_duration <- as.numeric(difftime(exit_time, entry_time, units = "mins"))
+          
+          # 打印滞留时间计算调试信息
+          print(paste("User:", user, "Grid:", current_grid, "Entry:", entry_time, "Exit:", exit_time, "Duration:", stay_duration))
+          
+          # 仅记录单次事件，不进行跨事件合并
+          if (stay_duration > 0) {
+            stay_events <- append(stay_events, list(data.table(
+              dailyid = user,
+              grid = current_grid,
+              entry_time = entry_time,
+              exit_time = exit_time,
+              stay_duration = stay_duration,
+              X_mean = row$X_mean  # 当前网格的 NDVI 值
+            )))
+          }
+        }
+        # 更新当前网格和进入时间
+        current_grid <- grid_id
+        entry_time <- row$timestamp
+      }
+    }
+  }
+  
+  # 如果没有生成任何滞留事件，给出提示
+  if (length(stay_events) == 0) {
+    warning("No stay events were identified.")
+    return(NULL)
+  }
+  
+  return(rbindlist(stay_events))
+}
+
+# 计算滞留事件
+stay_events <- identify_stay_events(mobile_ndvi)
+
+# 检查输出结果
+if (!is.null(stay_events)) {
+  print(head(stay_events))
+} else {
+  print("No stay events detected.")
+}
+
+####################### 定义计算暴露值的函数
+# 定义计算暴露值的函数
+calculate_exposure <- function(stay_events) {
+  # 计算停留暴露（滞留时间超过30分钟的部分）
+  stay_exposure <- stay_events[stay_duration > 30, .(stay_exposure = sum(X_mean)), by = dailyid]
+  # 计算流动暴露（滞留时间小于等于30分钟的部分）
+  flow_exposure <- stay_events[stay_duration <= 30, .(flow_exposure = sum(stay_duration * X_mean)), by = dailyid]
+  # 合并停留暴露和流动暴露，使用 all = TRUE 保留所有 ID
+  total_exposure <- merge(stay_exposure, flow_exposure, by = "dailyid", all = TRUE)
+  # 计算总时间
+  total_time <- stay_events[, .(total_time = sum(stay_duration)), by = dailyid]
+  # 合并总时间，使用 all = TRUE 保留所有 ID
+  total_exposure <- merge(total_exposure, total_time, by = "dailyid", all = TRUE)
+  # 用 0 替换 NA，确保计算时不会出错
+  total_exposure[is.na(stay_exposure), stay_exposure := 0]
+  total_exposure[is.na(flow_exposure), flow_exposure := 0]
+  total_exposure[is.na(total_time), total_time := 0]  # 确保时间不为空
+  # 计算动态暴露值，避免除以零的情况
+  total_exposure[, dynamic_exposure := ifelse(total_time > 0, (stay_exposure + flow_exposure) / total_time, NA)]
+  return(total_exposure)
+}
+# 计算动态绿地暴露值
+dynamic_exposure <- calculate_exposure(stay_events)
+print(head(dynamic_exposure))
+
+
+
+
+
+
+
+
